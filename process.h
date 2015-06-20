@@ -3,8 +3,8 @@ extern char etext, end;
 //TODO: minor add MAP_NORESERVE
 #define __USE_GNU
 
-#ifndef codebase_process_h
-#define codebase_process_h
+#ifndef case_process_h
+#define case_process_h
 
 #include <fcntl.h>
 #include <ucontext.h>

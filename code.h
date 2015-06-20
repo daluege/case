@@ -1,5 +1,5 @@
-#ifndef codebase_code_h
-#define codebase_code_h
+#ifndef case_code_h
+#define case_code_h
 
 #include "op.h"
 

@@ -1,5 +1,5 @@
-#ifndef codebase_op_h
-#define codebase_op_h
+#ifndef case_op_h
+#define case_op_h
 
 #define OP_KNOWN    1
 #define OP_BRANCH   2

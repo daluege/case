@@ -1,5 +1,5 @@
-#ifndef codebase_memory_h
-#define codebase_memory_h
+#ifndef case_memory_h
+#define case_memory_h
 
 #include <unistd.h>
 #include <sys/mman.h>
