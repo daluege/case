@@ -9,10 +9,10 @@
 #define OP_REGULAR  32
 #define OP_RM       64
 
-#define OP_INT3 0xcc
+#define OP_INT3 0xCC
 
-#define OP_EXPANSION 0x0f
-#define OP_RIP       0xff
+#define OP_EXPANSION 0x0F
+#define OP_RIP       0xFF
 
 #define OP_MAX_LENGTH  15
 

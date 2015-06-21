@@ -11,6 +11,7 @@ extern char etext, end;
 #include <unistd.h>
 #include <sched.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -23,15 +24,31 @@ extern char etext, end;
 
 // Scale corresponds to factor 2^scale
 #define PROCESS_SCALE 2
+// Number of free highest bits in lowest 2 byte
 #define PROCESS_SPACE 3
+// Beginning of text segment within space
 #define PROCESS_PAGE  (INT16_MIN<<1>>PROCESS_SPACE)
 // Cleft due to the high byte of a spring jump having to be shared with the opcode of the next jump
-#define PROCESS_CLEFT 0xE8000000
+#define PROCESS_CLEFT 0xE8CC0000 // Makes redundant high bytes usable as INT3 and a succeding JMP
+
+static const struct {
+  uint8_t call[5];
+  uint8_t shift[11];
+  uint8_t ret[1];
+} dict = {
+  { 0xE8, 0x0C, 0, 0, 0 }, // Push RIP+12 to the stack
+  { 0x48, 0xC1, 0x24, 0x24, PROCESS_SCALE+PROCESS_SPACE, 0x66, 0xC1, 0x6C, 0x24, 0xFE, PROCESS_SPACE }, // Shift right by PROCESS_SCALE+PROCESS_SPACE, shift left by PROCESS_SCALE
+  { 0xC3 } // Jump by return
+};
+
+typedef uint32_t spring_t;
 
 struct page {
   uint8_t jump;
   uint8_t trap;
   uint16_t size;
+  void *open;
+  uint8_t carry[OP_MAX_LENGTH];
   uint8_t text[];
 };
 
@@ -41,21 +58,25 @@ struct process {
   size_t text;
   size_t data;
   size_t heap;
-  uint8_t *ip;
-  size_t displacement;
-  struct page *page;
-  ucontext_t *ctx;
   int trap;
-  char open;
+  void *open;
 };
 
-typedef spring_t uint32_t;
+struct context {
+  void *text;
+  void *data;
+  void *spring;
+  struct page *page;
+  char size;
+  ucontext_t *ctx;
+};
 
 static struct process process = { 0 };
+static struct context context = { 0 };
 
 static inline void *getdata(void *spring) {
   *(uint16_t *) &spring <<= PROCESS_SPACE;
-  return spring>>PROCESS_SPACE>>PROCESS_SCALE;
+  return (void *) ((size_t) spring>>PROCESS_SPACE>>PROCESS_SCALE);
 }
 static inline void *getspring(void *data) {
   void *spring = (void *) ((size_t) data<<PROCESS_SCALE<<PROCESS_SPACE);
@@ -69,126 +90,87 @@ static inline void *getpage(void *data) {
   return (void *) (PROCESS_PAGE+((((size_t) data<<PROCESS_SCALE<<PROCESS_SPACE)+(int32_t) PROCESS_CLEFT)>>16<<16));
 }
 
-void process_seal(uint8_t *data) {
-  int i;
-  spring_t *spring;
-  uint8_t *target;
-  struct page *page;
+int branch_translate(uint8_t *text, uint8_t *data) {
+  uint8_t *destination, reg, mod, rm;
+  int size = 0;
 
-  data -= (size_t) data%process.pagesize;
-  spring =  getspring(data);
-  page = getpage(data);
+  switch (*data) {
+    case 0xFF:
+      reg = *data++>>3&7;
+      mod = *data>>6;
+      rm = *data&7;
 
-  // Initialize spring field: link all target points to a trap
-  for (i = 0, target = spring; i < process.pagesize; i++) {
-    target += footprint(data[i]); // Reserve space possibly claimed by instruction
-    *target = OP_INT3; // Signal a trap when calling untranslated positions
-    branch_call(spring[i], target, 5); // Places spring address on the stack and jumps to trap
+      switch (reg) {
+        case 2: // Opcode extension for indirect CALL
+          // Prepend a push of the RIP
+          memcpy(text+size, dict.call, sizeof(dict.call));
+          size += sizeof(dict.call);
+
+        case 4: // Opcode extension for indirect JMP and CALL
+          text[size++] = *data++;
+          text[size++] = *data++^reg<<3|6<<3; // Clear opcode extension and change it to 6 for PUSH
+
+          if (rm == 4) text[size++] = *data++; // SIB byte
+          if (mod == 1) text[size++] = *data++; // 8-byte displacement
+          if (mod == 2) {
+            *(int32_t *) (text+size) = *(int32_t *) data; // 32-byte displacement
+            size += 4;
+            data += 4;
+          }
+
+          memcpy(text+size, dict.shift, sizeof(dict.shift));
+          size += sizeof(dict.shift);
+
+          memcpy(text+size, dict.ret, sizeof(dict.ret));
+          size += sizeof(dict.ret);
+
+          return size;
+      }
+      break;
+
+    case 0xC3: case 0xCB: // RET context
+      memcpy(text, dict.shift, sizeof(dict.shift));
+      size += sizeof(dict.shift);
+
+      memcpy(text, dict.ret, sizeof(dict.ret));
+      size += sizeof(dict.ret);
+
+      return size;
   }
-  // Write-protect the spring page
-  mprotect(spring, process.pagesize<<PROCESS_SCALE, PROT_READ|PROT_EXEC);
-  // Watch the data page for changes
-  mprotect(data, process.pagesize, PROT_READ);
-}
-void process_release(uint8_t *data) {
-  uint8_t *text;
-  data -= (size_t) data%process.pagesize;
-  text = (uint8_t *) ((size_t) data<<PROCESS_SCALE);
 
-  // Signal execution attempts on the spring page
-  mprotect(spring, process.pagesize<<PROCESS_SCALE, PROT_READ);
-  // Release the data page from monitoring
-  mprotect(data, process.pagesize, PROT_READ|PROT_WRITE);
-}
-void process_open() {
-  // TODO: throw error if unsuccessful
-  if (process.open) return;
-  process.open = 1;
-  void *page = process.ip-(size_t) process.ip%process.pagesize;
-  mprotect((void *) process.data, process.heap-process.data, PROT_READ|PROT_WRITE);
-  mprotect(getpage(page), (uint16_t) -PROCESS_PAGE, PROT_READ|PROT_WRITE|PROT_EXEC);
-  mprotect(getspring(page), PROCESS_PAGE, PROT_READ|PROT_WRITE|PROT_EXEC);
-}
-void process_close() {
-  // TODO: throw error if unsuccessful
-  if (!process.open) return;
-  void *page = process.ip-(size_t) process.ip%process.pagesize;
-  mprotect((void *) process.data, process.heap-process.data, PROT_READ);
-  mprotect(getpage(page), (uint16_t) -PROCESS_PAGE, PROT_READ|PROT_EXEC);
-  mprotect(getspring(page), PROCESS_PAGE, PROT_READ|PROT_EXEC);
-  process.open = 0;
-}
-
-static inline void set_tf() {
-  asm("pushfq; orl $0x100, (%rsp); popfq");
-}
-static inline void unset_tf() {
-  asm("pushfq; xorl $0x100, (%rsp); popfq");
-}
-
-void step(void *text) {
-  spring_t *spring;
-  uint8_t *data;
-  struct page *page;
-  int flags, size;
-  size_t dest;
-
-  data = text-process.displacement;
-
-  process_open();
-
-  if (process.ip != NULL) {
-    flags = opflags(process.ip);
-
-    // For the set of jump instructions, we know their size
-    if (opflags(process.ip)&OP_BRANCH) size = branch_size(process.ip);
-    // Other sizes will be determined based on the RIP
-    else size = (size_t) text-(size_t) process.ip;
-
-    if (size > 0 && size <= OP_MAX_LENGTH) {
-      instruct(data, size);
-    } else {
-      unset_tf(); // A jump has occured, runtime translation ends for this pipeline
-      return;
+  // A direct jump of any size to a constant address in the data segment
+  destination = branch_resolve(data);
+  if (destination) {
+    uint8_t *spring = getspring(destination);
+    // Data and destination on the same page so the target may be resolved
+    if (((size_t) data^(size_t) destination) < process.pagesize) {
+      destination = branch_resolve(spring); // Resolve destination spring to text
+      if (destination) return branch_link(text, destination, -1);
     }
+    // Link the spring to destination
+    return branch_link(spring, text, -1);
   }
 
-  spring = getspring(data);
-  page = getpage(data);
-
-  // TODO: loop over next following regular instructions, disable TF and come back by INT3
-
-  size = translate(text, data);
-
-  // Write-protect page and sensitive segments
-  if (page != process.page) { // Page crossing
-    process_close(); // Always close as page looses focus
-  } else {
-    int secure;
-    // The next operation is secure if the destination is known and does not point to an unprotected core segment
-    dest = (size_t) resolve(text, process.ctx);
-    secure = dest && dest >= process.heap && dest^(size_t) page > INT16_MAX && dest^(size_t) spring > INT16_MAX;
-    // Only write-protect if next operation behavior unknown, otherwise save 3 syscalls
-    if (!secure) process_close();
-  }
-
-  process.displacement += size;
-  process.ip = text;
-  process.page = page;
+  return -1;
 }
 
-void instruct(uint8_t *data, char size) {
-  spring_t *spring = getspring(data);
-  uint8_t *page = process.page;
+int translate(uint8_t *text, uint8_t *data) {
+  int flags = opflags(data);
 
-  // Link instruction
-  branch_link(spring, page->text+page->size, 5);
-  // Causes retranslation upon instruction boundary shift
-  for (int i = 1; i < size; i++) spring[i] = OP_INT3; // TODO: check for page boundary
-  // TODO: process_seal on boundary shift so page gets completely flushed
-
-  page->size += size;
-  page->text[page->size] = OP_INT3;
+  if (flags&OP_INSECURE) switch (*data) {
+    case 0xFF:
+      return branch_translate(text, data);
+    case 0xCD: case 0xCE:
+      *(uint32_t *) text = 0xCD06;
+      return 2;
+    default: error("Not implemented");
+  }
+  if (flags&OP_KNOWN == 0) {
+    *(uint32_t *) text = 0xCD06;
+    return 2;
+  }
+  memcpy(text, data, OP_MAX_LENGTH);
+  return 0;
 }
 
 static inline char footprint(uint8_t *data) {
@@ -207,36 +189,156 @@ static inline char footprint(uint8_t *data) {
   return footprints[*data];
 }
 
-int translate(uint8_t *text, uint8_t *data) {
-  int flags = opflags(src);
+void process_seal(uint8_t *data) {
+  int i;
+  spring_t *spring;
+  uint8_t *target;
+  struct page *page;
 
-  if (flags&OP_INSECURE) switch (*data) {
-    case 0xFF: return branch_translate(dest, src);
-    case 0xCD: case 0xCE:
-      *(uint32_t *) text = 0xCD06;
-      return 2;
-    default: error("Not implemented");
+  data -= (size_t) data%process.pagesize;
+  spring =  getspring(data);
+  page = getpage(data);
+  memset(page, 0, sizeof(struct page));
+
+  // Trap carry field handling old carryover links
+  memset(page->carry, OP_INT3, sizeof(page->carry)); // TODO: check sizeof is right
+
+  // Initialize spring field: link all target points to a trap
+  for (i = 0, target = page->text; i < process.pagesize; i++) {
+    target += footprint(data+i); // Reserve space possibly claimed by context
+    *target = OP_INT3; // Signal a trap when calling untranslated positions
+    branch_call(spring+i, target, 5); // Places spring address on the stack and jumps to trap
   }
-  if (flags&OP_KNOWN == 0) {
-    *(uint32_t *) text = 0xCD06;
-    return 2;
+  // Write-protect the spring page
+  if (mprotect(spring, process.pagesize<<PROCESS_SCALE, PROT_READ|PROT_EXEC) < 0) raise(SIGSEGV);
+  // Watch the data page for changes
+  if (mprotect(data, process.pagesize, PROT_READ) < 0) raise(SIGSEGV);
+}
+void process_release(uint8_t *data) {
+  spring_t *spring;
+
+  data -= (size_t) data%process.pagesize;
+  spring =  getspring(data);
+
+  // Signal execution attempts on the spring page
+  mprotect(spring, process.pagesize<<PROCESS_SCALE, PROT_READ);
+  // Release the data page from monitoring
+  mprotect(data, process.pagesize, PROT_READ|PROT_WRITE);
+}
+void process_open(void *data) {
+  struct page *page;
+  data -= (size_t) data%process.pagesize;
+  page = getpage(data);
+
+  if (process.open == page) return; // For efficiency reasons
+  if (!process.open && mprotect((void *) process.data, process.heap-process.data, PROT_READ|PROT_WRITE) < 0) raise(SIGSEGV);
+  if (mprotect(page, (uint16_t) -PROCESS_PAGE, PROT_READ|PROT_WRITE|PROT_EXEC) < 0) raise(SIGSEGV);
+  if (mprotect(getspring(data), PROCESS_PAGE, PROT_READ|PROT_WRITE|PROT_EXEC) < 0) raise(SIGSEGV);
+
+  // Insert opened page into linked list
+  page->open = process.open;
+  process.open = data;
+}
+void process_close() {
+  struct page *page;
+
+  // Close all open pages
+  while (process.open) {
+    page = getpage(process.open);
+    if (mprotect(page, (uint16_t) -PROCESS_PAGE, PROT_READ|PROT_EXEC) < 0) raise(SIGSEGV);
+    if (mprotect(getspring(process.open), PROCESS_PAGE, PROT_READ|PROT_EXEC) < 0) raise(SIGSEGV);
+    process.open = page->open; // Remove origin page from linked list
   }
-  memcpy(dest, data, OP_MAX_LENGTH);
-  return 0;
+  if (mprotect((void *) process.data, process.heap-process.data, PROT_READ) < 0) raise(SIGSEGV);
 }
 
+void leave() {
+  unset_tf();
+}
+void step(void *text) {
+  struct context origin;
+  int flags;
+  ptrdiff_t size;
+  size_t dest;
+
+  // Skip step if the current pointer is within the translation (multiple context unit)
+  if (context.size > 0 && text >= context.text && text < context.text+context.size) return;
+
+  process_open(context.data);
+
+  origin = context;
+  context.text = text;
+
+  // Revise the last instruction pointer
+  if (origin.text) {
+    int branch;
+
+    flags = opflags(origin.data);
+
+    // For the set of jump instructions, we know their size
+    size = branch_size(origin.data);
+    if (size >= 0 && size != context.text-origin.text) { // A branch has occured
+      leave();
+      return;
+    }
+
+    // Other sizes will be determined based on the RIP
+    if (size < 0) size = context.text-origin.text;
+
+    // Last instruction is not a jump if the size is reasonable
+    if (size > 0 && size <= OP_MAX_LENGTH) {
+      // Move the data pointer along with text
+      context.data += size;
+      context.page = getpage(context.data);
+      context.spring = getspring(context.data);
+
+      if (context.page == origin.page) {
+        // Create a link in the spring field
+        branch_link(origin.spring, origin.text, 5);
+      } else { // A page transition with the last instruction covering the page boundary is about to happen
+        process_open(context.data); // Open the next page
+        size = context.text-origin.text; // Text difference to last step
+        context.text = branch_resolve(context.spring); // Find entry point
+        // TODO: handle (impossible) NULL return
+        memcpy(context.text, origin.text-size, size); // Carry over crossing instruction
+        // Cross-page link carry instruction
+        branch_link(origin.spring, context.text-size, 5);
+        branch_link(origin.text, context.text-size, -1);
+      }
+    }
+  }
+
+  // TODO: loop over next following regular instructions, disable TF and come back by INT3
+
+  context.size = translate(context.text, context.data);
+
+  // Write-protect page and sensitive segments
+  if (origin.page != context.page) {
+    process_close(); // Always as origin page is being abandoned
+  } else {
+    int secure;
+    // The next operation is secure if the destination is known and does not point to an unprotected core segment
+    dest = (size_t) resolve(context.text, context.ctx);
+    secure = dest && dest >= process.heap && (dest^(size_t) context.page) > INT16_MAX && (dest^(size_t) context.spring) > INT16_MAX;
+    // Only write-protect if next operation behavior unknown, otherwise leave open saves 3 syscalls
+    if (!secure) process_close();
+  }
+}
 void enter(void *data) {
-  uint8_t *spring, *page, *text;
+  uint8_t *spring, *text;
+  struct page *page;
+
   spring = getspring(data);
   page = getpage(data);
   text = branch_resolve(spring);
 
-  // Page-relative overhead of translated text with respect to data
-  process.displacement = text-data;
-  process.ip = NULL;
+  context.text = NULL;
+  context.page = page;
 
+  set_tf();
   step(text);
 }
+
 
 void process_exec(void *data) {
   process_seal(data);
@@ -251,9 +353,9 @@ void process_breakpoint(uint8_t *text) {
 
   // Breakpoints are always induced by a CALL
   asm("pop %0" : "=r" (spring)); // Get return address from the stack pointer
-  // Get instruction before (on 4-byte spring boundary)
+  // Get context before (on 4-byte spring boundary)
   spring -= 2;
-  spring &= -1<<PROCESS_SCALE;
+  spring -= (size_t) spring%(1<<PROCESS_SCALE);
   enter(getdata(spring));
 }
 
@@ -368,70 +470,6 @@ extern void *process_malloc(size_t size) {
     return NULL;
   }
   return addr;
-}
-
-static const struct {
-  uint8_t call[5];
-  uint8_t shift[11];
-  uint8_t ret[1];
-} dict = {
-  { 0xE8, 0x0C, 0, 0, 0 }, // Push RIP+12 to the stack
-  { 0x48, 0xC1, 0x24, 0x24, PROCESS_SCALE+PROCESS_SPACE, 0x66, 0xC1, 0x6C, 0x24, 0xFE, PROCESS_SPACE }, // Shift right by PROCESS_SCALE+PROCESS_SPACE, shift left by PROCESS_SCALE
-  { 0xC3 } // Jump by return
-};
-
-int branch_translate(uint8_t *text, uint8_t *data) {
-  uint8_t reg, mod, rm;
-
-  switch (*data) {
-    case 0xFF:
-      reg = *data++>>3&7;
-      mod = *data>>6;
-      rm = *data&7;
-
-      switch (reg) {
-        case 2: // Opcode extension for indirect CALL
-          memcpy(text, dict.call, sizeof(dict.call));
-          text += sizeof(dict.call);
-
-        case 4: // Opcode extension for indirect JMP and CALL
-          *text++ = *data++;
-          *text++ = *data++^reg<<3|6<<3; // Clear opcode extension and change it to 6 for PUSH
-
-          if (rm == 4) *text++ = *data++; // SIB byte
-          if (mod == 1) *text++ = *data++; // 8-byte displacement
-          if (mod == 2) {
-            *(int32_t *) text = *(int32_t *) data; // 32-byte displacement
-            text += 4;
-            data += 4;
-          }
-
-          memcpy(text, dict.shift, sizeof(dict.shift));
-          text += sizeof(dict.shift);
-
-          memcpy(text, dict.ret, sizeof(dict.ret));
-          text += sizeof(dict.ret);
-
-          return (size_t) text-(size_t) dest;
-      }
-      break;
-
-    case 0xC3: case 0xCB: // RET instruction
-      memcpy(text, dict.shift, sizeof(dict.shift));
-      text += sizeof(dict.shift);
-
-      memcpy(text, dict.ret, sizeof(dict.ret));
-      text += sizeof(dict.ret);
-  }
-
-  dest = branch_resolve(data);
-  if (dest) {
-    uint8_t *spring = getspring(dest), *dest = branch_resolve(spring);
-    if (dest) return branch_link(dest, text, -1);
-    else return branch_link(spring, text, -1);
-  }
-
-  return -1;
 }
 
 
