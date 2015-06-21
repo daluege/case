@@ -165,7 +165,7 @@ int translate(uint8_t *text, uint8_t *data) {
       return 2;
     default: error("Not implemented");
   }
-  if (flags&OP_KNOWN == 0) {
+  if (~flags&OP_KNOWN) {
     *(uint32_t *) text = 0xCD06;
     return 2;
   }

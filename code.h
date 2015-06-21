@@ -75,18 +75,20 @@ void *resolve(void *addr, ucontext_t *ctx) {
   // TODO: resolve at runtime by LEA if ctx == NULL
   
   size_t result = 0;
-  uint8_t *data = addr, s, d, reg, mod, rm, scale, index, base;
+  uint8_t *data = addr, op, s, d, reg, mod, rm, scale, index, base;
   int flags;
 
   flags = opflags(data);
-  if (flags&OP_REGULAR == 0) return branch_resolve(addr); // Not regular, try to resolve branch
-  if (*data++&2 > 0) return NULL; // First operand is not a memory location
+  op = *data++;
+  if (flags&OP_REGULAR && (op&2) > 0) return NULL; // First operand is not a memory location
 
   reg = *data>>3&7;
   mod = *data>>6;
   rm = *data++&7;
   if (mod == 3) return NULL; // Destination is not indirect but a register
 
+  if (~flags&OP_REGULAR) if (!(op == 0xFE && reg < 2 || op == 0xFF && reg != 3 && reg != 5)) return branch_resolve(addr); // Not regular, try to resolve branch
+  
   if (rm == 5 && mod == 0) { // 32-bit displacement-only mode
     result = *(size_t *) data;
     data += 4;
