@@ -16,9 +16,9 @@
 
 #define OP_MAX_LENGTH  15
 
-const char OPCODES[256];
+const uint8_t OPCODES[256];
 
-static inline char opflags(const char *text) {
+static inline uint8_t opflags(const uint8_t *text) {
   if (OPCODES[*text] == OP_EXPANSION) return OPCODES[text[1]]&OP_BRANCH;
   return OPCODES[*text];
 }
@@ -45,7 +45,7 @@ struct operand {
 
 //const struct operand op_jmp_dest(void *dest, const int max, const void *src, const int s, const int d) {
 
-const char OPCODES[256] = {
+const uint8_t OPCODES[256] = {
   OP_KNOWN|OP_REGULAR,
   OP_KNOWN|OP_REGULAR,
   OP_KNOWN|OP_REGULAR,
@@ -240,19 +240,19 @@ const char OPCODES[256] = {
   OP_KNOWN,
   OP_KNOWN|OP_BRANCH|OP_INDIRECT,
   OP_KNOWN|OP_BRANCH|OP_INDIRECT,
-  OP_KNOWN,
-  OP_KNOWN,
+  OP_INSECURE, // RETN
+  OP_INSECURE, // RETN
   OP_KNOWN,
   OP_KNOWN,
   OP_KNOWN,
   OP_KNOWN,
   OP_KNOWN|OP_BRANCH|OP_INDIRECT,
   OP_KNOWN|OP_BRANCH|OP_INDIRECT,
-  OP_INSECURE,
-  OP_INSECURE,
-  OP_INSECURE,
-  OP_BRANCH|OP_INDIRECT|OP_INSECURE,
-  OP_BRANCH|OP_INDIRECT|OP_INSECURE,
+  OP_INSECURE, // RETF
+  OP_INSECURE, // RETF
+  OP_INSECURE, // INT3
+  OP_BRANCH|OP_INDIRECT|OP_INSECURE, // INT
+  OP_BRANCH|OP_INDIRECT|OP_INSECURE, // INTO
   OP_KNOWN,
   OP_KNOWN,
   OP_KNOWN,
@@ -303,7 +303,7 @@ const char OPCODES[256] = {
   OP_KNOWN,
   OP_KNOWN };
 
-char OPS2[256] = {
+const uint8_t OPS2[256] = {
   0,
   0,
   0,

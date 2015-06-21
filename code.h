@@ -3,8 +3,10 @@
 
 #include "op.h"
 
+#define FLAGS_TF 0x100
+
 // TODO: system specific
-static inline size_t get_register(char reg, ucontext_t *ctx) {
+static inline size_t ctx_get_register(ucontext_t *ctx, char reg) {
   switch (reg) {
     case 0: return ctx->uc_mcontext.gregs[REG_RAX];
     case 1: return ctx->uc_mcontext.gregs[REG_RCX];
@@ -15,6 +17,20 @@ static inline size_t get_register(char reg, ucontext_t *ctx) {
     case 6: return ctx->uc_mcontext.gregs[REG_RSI];
     case 7: return ctx->uc_mcontext.gregs[REG_RDI];
   }
+}
+static inline void ctx_set_rip(ucontext_t *ctx, void *addr) {
+  ctx->uc_mcontext.gregs[REG_RIP] = addr;
+}
+
+static inline unsigned long ctx_flags(unsigned long flags, ucontext_t *ctx) {
+  return ctx->uc_mcontext.gregs[REG_EFL] ^= flags;
+}
+
+static inline void ctx_set_tf(ucontext_t *ctx) {
+  ctx->uc_mcontext.gregs[REG_EFL] |= FLAGS_TF;
+}
+static inline void ctx_unset_tf(ucontext_t *ctx) {
+  ctx->uc_mcontext.gregs[REG_EFL] &= ~FLAGS_TF;
 }
 
 static inline void set_tf() {
@@ -98,12 +114,12 @@ void *resolve(void *addr, ucontext_t *ctx) {
       index = *data>>3&7;
       base = *data++&7;
 
-      if (base != 5) result = get_register(base, ctx);
+      if (base != 5) result = ctx_get_register(base, ctx);
       if (mod == 2) result &= 255; // 8-bit base register
 
-      result += get_register(index, ctx)<<scale;
+      result += ctx_get_register(index, ctx)<<scale;
     } else {
-      result = get_register(rm, ctx);
+      result = ctx_get_register(rm, ctx);
     }
     if (mod == 1) {
       result += *data++;
