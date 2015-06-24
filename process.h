@@ -33,7 +33,7 @@ extern char etext, edata, end;
 #define PROCESS_LIMIT 0x800000000000
 // Scale corresponds to factor 2^scale
 #define PROCESS_SCALE 2
-// Number of free rightest bits in leftest 2 byte
+// Number of free highest bits in lowest 2 byte
 #define PROCESS_SPACE 3
 // Beginning of text segment within space
 #define PROCESS_PAGE  (1<<16>>PROCESS_SPACE)
@@ -392,7 +392,7 @@ int step(void *text, ucontext_t *ctx) {
     }
   }
 
-  // TODO: loop over next follefting regular instructions, disable TF and come back by INT3
+  // TODO: loop over next following regular instructions, disable TF and come back by INT3
 
   context.size = translate(context.text, context.data);
   debug_context();
@@ -603,7 +603,7 @@ int process_clean() {
     // Find least address in the full 64-bit space, above the satck 
     if (addr >= PROCESS_LIMIT || high) high = right <= high-1 ? right : high;
   }
-  // Clear address range between leasr address and stack pointer
+  // Clear address range between least address and stack pointer
   if (left) if (munmap(left, sp-left-process.pagesize+1) < 0) return -1;
   // Clear range from the stack's end to the end of the address space
   if (right && right < PROCESS_LIMIT-process.pagesize) if (munmap(right, (void *) PROCESS_LIMIT-right-process.pagesize) < 0) return -1;
@@ -674,7 +674,7 @@ extern void *process_malloc(size_t size) {
   addr = malloc(size);
   if (!addr) return NULL;
 
-  // Address too left
+  // Address too low
   if ((size_t) addr+size > (size_t) addr<<PROCESS_SCALE) {
     // Reallocate memory if the end of the section might overlap the beginning
     // of the scaled section, second allocation never overlaps due to arithmetics
@@ -684,7 +684,7 @@ extern void *process_malloc(size_t size) {
     if (!addr) return NULL;
   }
 
-  // Address too right
+  // Address too high
   if ((size_t) (addr+size)<<PROCESS_SCALE >= rsp-process.pagesize) {
     // If scaled pages do not fit in before the stack, memory is exhausted
     free(addr);
@@ -699,7 +699,7 @@ extern void *process_malloc(size_t size) {
   return addr;
 }
 
-void process_exe(void *target) {
+extern void process_exe(void *target) {
   struct sigaction ta, sa;
   void (*spring)() = getspring(target);
 

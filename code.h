@@ -61,7 +61,7 @@ void *branch_resolve(void *addr) {
   uint8_t *text = addr;
   switch (*text++) {
     case 0xEB: return addr+2+(int8_t) *text;
-    case 0xE9: case 0xE8: case OP_INT3: return addr+5+*(int32_t *) text;
+    case 0xE9: case 0xE8: return addr+5+*(int32_t *) text;
     default: return NULL;
   }
 }
