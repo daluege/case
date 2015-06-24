@@ -61,13 +61,14 @@ void *branch_resolve(void *addr) {
   uint8_t *text = addr;
   switch (*text++) {
     case 0xEB: return addr+2+(int8_t) *text;
-    case 0xE9: case 0xE8: return addr+5+*(int32_t *) text;
+    case 0xE9: case 0xE8: case OP_INT3: return addr+5+*(int32_t *) text;
     default: return NULL;
   }
 }
 int branch_size(void *addr) {
   uint8_t *text = addr, reg, mod, rm;
   switch (*text++) {
+    case 0xC3: case 0xCB: return 1; // RET
     case 0xEB: return 2; // Short JMP
     case 0xE9: case 0xE8: return 5; // Near JMP and CALL
     case 0xFF:
@@ -114,12 +115,12 @@ void *resolve(void *addr, ucontext_t *ctx) {
       index = *data>>3&7;
       base = *data++&7;
 
-      if (base != 5) result = ctx_get_register(base, ctx);
+      if (base != 5) result = ctx_get_register(ctx, base);
       if (mod == 2) result &= 255; // 8-bit base register
 
-      result += ctx_get_register(index, ctx)<<scale;
+      result += ctx_get_register(ctx, index)<<scale;
     } else {
-      result = ctx_get_register(rm, ctx);
+      result = ctx_get_register(ctx, rm);
     }
     if (mod == 1) {
       result += *data++;

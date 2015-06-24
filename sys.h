@@ -1,6 +1,14 @@
 #ifndef case_sys_h
 #define case_sys_h
 
+#define SYS_MPROTECT  125
+
+int sys_mprotect(void *addr, size_t len, int prot) {
+  int r;
+  asm ("int $0x80": "=a"(r): "a"(SYS_MPROTECT), "b"(addr), "c"(len), "d"(prot));
+  return r;
+}
+
 int sys_brk(void *addr) {
   static size_t brk = NULL;
   size_t page;

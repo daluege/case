@@ -1,20 +1,24 @@
-extern char etext, end;
+extern char etext, edata, end;
 
-//TODO: minor add MAP_NORESERVE
+//TODO: minor add MAP_NORESERVE, MAP_UNINITIALIZED
 #define __USE_GNU
 
 #ifndef case_process_h
 #define case_process_h
 
+#include <dlfcn.h>
 #include <fcntl.h>
-#include <ucontext.h>
-#include <unistd.h>
+#include <link.h>
 #include <sched.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
+#include <ucontext.h>
+#include <unistd.h>
 #include "memory.h"
 #include "code.h"
 #include "op.h"
@@ -22,22 +26,46 @@ extern char etext, end;
 // Constants
 #define PROCESS_X64   64
 
+// Settings
+#define PROCESS_MASK  1
+
+// The AMD64 address limit
+#define PROCESS_LIMIT 0x800000000000
 // Scale corresponds to factor 2^scale
 #define PROCESS_SCALE 2
-// Number of free highest bits in lowest 2 byte
+// Number of free rightest bits in leftest 2 byte
 #define PROCESS_SPACE 3
 // Beginning of text segment within space
 #define PROCESS_PAGE  (1<<16>>PROCESS_SPACE)
-// Cleft due to the high byte of a spring jump having to be shared with the opcode of the next jump
-#define PROCESS_CLEFT 0xE8CC0000 // Makes redundant high bytes usable as INT3 and a succeding JMP
+// Cleft due to the right byte of a spring jump having to be shared with the opcode of the next jump
+#define PROCESS_CLEFT 0xE8000000 // Makes redundant right bytes usable as INT3 and a succeding JMP
 
-static const struct {
+// 64-bit executable zones of insecurity in POSIX and LINUX
+// text:                static linking by ld with option -Ttext=0x... ensures that text section is always in
+//                      a segment whose address has non-zero PROCESS_SPACE bit, thus is not reachable by an indirect case jump
+// dynamic libraries:   are not used, the program is linked statically; additionally, linked libraries are unmapped
+//                      at runtime
+// vdso:                is unmapped at runtime
+// vsyscall:            is not reachable as a non-zero bit intersects with the PROCESS_SPACE-zeroed bits of jump targets
+// unknown:             unexpected executable segments may arise from kernel changes and unknown OS-specific technologies;
+//                      /proc/self/maps is parsed upon process_create in order to verify no unkown sections are executable
+
+static struct {
   uint8_t call[5];
-  uint8_t shift[11];
+  struct {
+    uint8_t text[3];
+    uint8_t displacement;
+    uint8_t mask;
+  } mask;
+  struct {
+    uint8_t shl[5];
+    uint8_t shr[5];
+  } shift;
   uint8_t ret[1];
 } dict = {
   { 0xE8, 0x0C, 0, 0, 0 }, // Push RIP+12 to the stack
-  { 0x48, 0xC1, 0x24, 0x24, PROCESS_SCALE+PROCESS_SPACE, 0x66, 0xC1, 0x6C, 0x24, 0xFE, PROCESS_SPACE }, // Shift right by PROCESS_SCALE+PROCESS_SPACE, shift left by PROCESS_SCALE
+  { { 0x80, 0x64, 0x24 }, 0, 0 }, // Unset rightest bit of address space
+  { { 0x48, 0xC1, 0x24, 0x24, PROCESS_SCALE+PROCESS_SPACE }, { 0x66, 0xC1, 0x2C, 0x24, PROCESS_SPACE } }, // Shift right by PROCESS_SCALE+PROCESS_SPACE, shift left by PROCESS_SCALE: shlq $5, (%rsp); shrw $2, (%rsp)
   { 0xC3 } // Jump by return
 };
 
@@ -60,6 +88,9 @@ struct process {
   size_t heap;
   int trap;
   void *open;
+  void *exit;
+  struct sigaction sigsegv;
+  struct sigaction sigtrap;
 };
 
 struct context {
@@ -74,20 +105,21 @@ struct context {
 static struct process process = { 0 };
 static struct context context = { 0 };
 
-static inline void *getdata(void *spring) {
-  *(uint16_t *) &spring <<= PROCESS_SPACE;
-  return (void *) ((size_t) spring>>PROCESS_SPACE>>PROCESS_SCALE);
-}
+
 static inline void *getspring(void *data) {
   void *spring = (void *) ((size_t) data<<PROCESS_SCALE<<PROCESS_SPACE);
   *(uint16_t *) &spring >>= PROCESS_SPACE;
   return spring;
 }
-static inline void *gettext(void *data) {
-  return branch_resolve(getspring(data));
-}
 static inline void *getpage(void *data) {
   return (void *) (PROCESS_PAGE+((((size_t) data<<PROCESS_SCALE<<PROCESS_SPACE)+(int32_t) PROCESS_CLEFT)>>16<<16));
+}
+static inline void *gettext(void *spring) {
+  return spring+(*(int32_t *) spring>>8)+(int32_t) PROCESS_CLEFT;
+}
+static inline void *getdata(void *spring) {
+  *(uint16_t *) &spring <<= PROCESS_SPACE;
+  return (void *) ((size_t) spring>>PROCESS_SPACE>>PROCESS_SCALE);
 }
 
 static inline void debug_context() {
@@ -97,12 +129,13 @@ static inline void debug_context() {
 }
 static inline void debug(const char *message) {
 #ifdef DEBUG
-  puts(message);
+  write(0, message, strlen(message));
+  write(0, "\n", 1);
 #endif
 }
-static inline void debug_ctx(ucontext_t *ctx) {
+static inline void debug_ctx(ucontext_t *ctx, siginfo_t *info) {
 #ifdef DEBUG
-  printf("RIP:\t%p\t- %p\nTF:\t%i\nERR:\t%i\n", ctx->uc_mcontext.gregs[REG_RIP],  *(size_t *) ctx->uc_mcontext.gregs[REG_RIP], ctx->uc_mcontext.gregs[REG_EFL]&0x100, ctx->uc_mcontext.gregs[REG_ERR]);
+  if(ctx) printf("RIP:\t%p\t- %p\nTF:\t%i\nERR:\t%i\nEAX:\t%p\nDest:\t%p\n", ctx->uc_mcontext.gregs[REG_RIP],  getdata(ctx->uc_mcontext.gregs[REG_RIP]), ctx->uc_mcontext.gregs[REG_EFL]&0x100, ctx->uc_mcontext.gregs[REG_ERR], ctx->uc_mcontext.gregs[REG_RAX], info ? info->si_addr : NULL);
 #endif
 }
 
@@ -134,7 +167,12 @@ int branch_translate(uint8_t *text, uint8_t *data) {
             data += 4;
           }
 
-          memcpy(text+size, dict.shift, sizeof(dict.shift));
+#ifdef PROCESS_MASK
+          memcpy(text+size, &dict.mask, sizeof(dict.mask));
+          size += sizeof(dict.mask);
+#endif
+
+          memcpy(text+size, &dict.shift, sizeof(dict.shift));
           size += sizeof(dict.shift);
 
           memcpy(text+size, dict.ret, sizeof(dict.ret));
@@ -145,10 +183,10 @@ int branch_translate(uint8_t *text, uint8_t *data) {
       break;
 
     case 0xC3: case 0xCB: // RET context
-      memcpy(text, dict.shift, sizeof(dict.shift));
+      memcpy(text, &dict.shift, sizeof(dict.shift));
       size += sizeof(dict.shift);
 
-      memcpy(text, dict.ret, sizeof(dict.ret));
+      memcpy(text+size, dict.ret, sizeof(dict.ret));
       size += sizeof(dict.ret);
 
       return size;
@@ -160,7 +198,7 @@ int branch_translate(uint8_t *text, uint8_t *data) {
     uint8_t *spring = getspring(destination);
     // Data and destination on the same page so the target may be resolved
     if (((size_t) data^(size_t) destination) < process.pagesize) {
-      destination = branch_resolve(spring); // Resolve destination spring to text
+      destination = gettext(spring); // Resolve destination spring to text
       if (destination) return branch_link(text, destination, -1);
     }
     // Link the spring to destination
@@ -173,14 +211,15 @@ int branch_translate(uint8_t *text, uint8_t *data) {
 int translate(uint8_t *text, uint8_t *data) {
   int flags = opflags(data), size;
 
+  if (flags&OP_BRANCH) {
+    size = branch_translate(text, data);
+    if (size >= 0) return size;
+  }
   if (flags&OP_INSECURE) switch (*data) {
     case 0xCC: case 0xCD: case 0xCE:
       *(uint32_t *) text = 0x06CD;
       return 2;
-    default:
-      size = branch_translate(text, data);
-      if (size < 0) error("Not implemented");
-      return size;
+    default: error("Unknown insecure instruction");
   }
   if (~flags&OP_KNOWN) {
     *(uint32_t *) text = 0x06CD;
@@ -209,7 +248,7 @@ static inline char footprint(uint8_t *data) {
 int process_seal(uint8_t *data) {
   int i;
   spring_t *spring;
-  uint8_t *target;
+  uint8_t *text, *target;
   struct page *page;
 
   data -= (size_t) data%process.pagesize;
@@ -229,10 +268,12 @@ int process_seal(uint8_t *data) {
   memset(page->carry, OP_INT3, sizeof(page->carry)); // TODO: check sizeof is right
 
   // Initialize spring field: link all target points to a trap
-  for (i = 0, target = page->text; i < process.pagesize; i++) {
-    target += footprint(data+i); // Reserve space possibly claimed by context
-    *target = OP_INT3; // Signal a trap when calling untranslated positions
-    if (i < process.pagesize-1) branch_call(spring+i, target, 5); // Places spring address on the stack and jumps to trap
+  for (i = 0, text = page->text; i < process.pagesize; i++) {
+    target = (uint8_t *) &spring[i];
+    text += footprint(data+i); // Reserve space possibly claimed by context
+    *text = OP_INT3; // Signal a trap when calling untranslated positions
+    if (i < process.pagesize-1) branch_link(spring+i, text, 5); // Map address
+    *target = OP_INT3; // However, signal trap on jump
   }
 
   return 0;
@@ -256,8 +297,10 @@ int process_open(void *data) {
   struct page *page;
   data -= (size_t) data%process.pagesize;
 
-  if (process.open == data) return; // Optimization
+  // TODO: refactor data == NULL and open = false
+  if (process.open == data && data) return; // Optimization
   if (!process.open && mprotect((void *) process.data, process.heap-process.data, PROT_READ|PROT_WRITE) < 0) return -1;
+  // The text segment is never reachable by an indirect jump due to non-zero space bits and does not need to be protected, so the vsyscall segment
 
   if (data) {
     page = getpage(data);
@@ -283,6 +326,7 @@ int process_close() {
 
 int leave() {
   debug("Leave");
+  debug_context();
   
   process_close();
   process_open(NULL);
@@ -299,10 +343,10 @@ int step(void *text, ucontext_t *ctx) {
   size_t dest;
 
   // Skip step if the current pointer is within the translation (multiple context unit)
-  if (context.size > 0 && text >= context.text && text < context.text+context.size) return 0;
-
-  // Stop tracing once program has reached the core text segment (security of destination is ensured at jump level)
-  if ((size_t) text < process.data) return leave();
+  if (context.size > 0 && text >= context.text && text < context.text+context.size) {
+    debug("Skip");
+    return 0;
+  }
 
   // Any write access in the data segment requires process_open
   if (process_open(context.data) < 0) return -1;
@@ -319,6 +363,7 @@ int step(void *text, ucontext_t *ctx) {
 
     // For the set of jump instructions, we know their size
     size = branch_size(origin.data);
+
     if (size >= 0 && size != context.text-origin.text) return leave();
 
     // Other sizes will be determined based on the RIP
@@ -337,7 +382,7 @@ int step(void *text, ucontext_t *ctx) {
       } else { // A page transition with the last instruction covering the page boundary is about to happen
         if (process_open(context.data) < 0) return -1; // Open the next page
         size = context.text-origin.text; // Text difference to last step
-        context.text = branch_resolve(context.spring); // Find entry point
+        context.text = gettext(context.spring); // Find entry point
         // TODO: handle (impossible) NULL return
         memcpy(context.text, origin.text-size, size); // Carry over crossing instruction
         // Cross-page link carry instruction
@@ -347,7 +392,7 @@ int step(void *text, ucontext_t *ctx) {
     }
   }
 
-  // TODO: loop over next following regular instructions, disable TF and come back by INT3
+  // TODO: loop over next follefting regular instructions, disable TF and come back by INT3
 
   context.size = translate(context.text, context.data);
   debug_context();
@@ -357,8 +402,8 @@ int step(void *text, ucontext_t *ctx) {
     if (process_close() < 0) return -1; // Always as origin page is being abandoned
   } else {
     int secure;
+    dest = (size_t) resolve(context.text, context.ctx); // TODO: optimize - no decoding of rel jumps
     // The next operation is secure if the destination is known and does not point to an unprotected core segment
-    dest = (size_t) resolve(context.text, context.ctx);
     secure = dest && dest >= process.heap && (dest^(size_t) context.page) > INT16_MAX && (dest^(size_t) context.spring) > INT16_MAX;
     // Only write-protect if next operation behavior unknown, otherwise leave open saves 3 syscalls
     if (!secure && process_close() < 0) return -1;
@@ -366,18 +411,19 @@ int step(void *text, ucontext_t *ctx) {
 
   return 0;
 }
-int enter(void *data, ucontext_t *ctx) {
+int enter(spring_t *spring, ucontext_t *ctx) {
   debug("Enter");
   
-  uint8_t *spring, *text;
+  uint8_t *data, *text;
   struct page *page;
 
-  spring = getspring(data);
+  data = getdata(spring);
   page = getpage(data);
-  text = branch_resolve(spring);
+  text = gettext(spring);
   if (!text) error("No spring instruction found");
 
   process_open(NULL);
+
   context.text = NULL;
   context.data = data;
   context.page = page;
@@ -388,69 +434,90 @@ int enter(void *data, ucontext_t *ctx) {
   return step(text, ctx);
 }
 
+int process_exit() {
+  debug("Exit");
 
-int process_exec(void *data, ucontext_t *ctx) {
+  process_open(NULL);
+  sigaction(SIGSEGV, &process.sigsegv, NULL);
+  sigaction(SIGTRAP, &process.sigtrap, NULL);
+  process.exit = NULL;
+  // Restore the text protection in case any of its pages were excecution targets
+  mprotect((void *) process.text, process.data-process.text, PROT_READ|PROT_EXEC);
+  return 0;
+}
+
+int process_exec(spring_t *spring, ucontext_t *ctx) {
   debug("Exec");
-  
+
+  uint8_t *data = getdata(spring);
+
+  if (!process.exit) {
+    //...
+  }
+
+  if (data == process.exit) {
+    ctx_set_rip(ctx, data);
+    if (process_exit() < 0) return -1;
+    return 0;
+  }
+
   if (process_seal(data) < 0) return -1;
 
-  return enter(data, ctx);
+  return enter(spring, ctx);
 }
 int process_write(void *data, ucontext_t *ctx) {
   debug("Write");
   
   if (process_release(data) < 0) return -1;
-  debug_ctx(ctx);
+  debug_ctx(ctx, NULL);
 
   return 0;
 }
-int process_breakpoint(uint8_t *text, ucontext_t *ctx) {
+int process_breakpoint(spring_t *spring, ucontext_t *ctx) {
   debug("Breakpoint");
   
-  error("Unimplemented");
-  uint8_t *spring, *data;
+  uint8_t *data = getdata(spring);
   struct page *page;
 
-  // Breakpoints are always induced by a CALL
-  asm("pop %0" : "=r" (spring)); // Get return address from the stack pointer
-  // Get context before (on 4-byte spring boundary)
-  spring -= 2;
-  spring -= (size_t) spring%(1<<PROCESS_SCALE);
-  return enter(getdata(spring), ctx);
+  if (data == process.exit) {
+    ctx_set_rip(ctx, data);
+    if (process_exit() < 0) return -1;
+    return 0;
+  }
+
+  return enter(spring, ctx);
 }
 
 void process_raise(int sig) {
   debug("Raise");
 
-  struct sigaction ract, sact;
+  struct sigaction ra, sa;
 
-  // TODO: implement trigger signal handler installed by application (custom sys_sigaction)
-
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = SIG_DFL;
   // Restore default signal action
-  memset(&sact, 0, sizeof(struct sigaction));
-  sact.sa_sigaction = SIG_DFL;
-  sigaction(SIGTRAP, &sact, &ract);
+  sigaction(SIGTRAP, &sa, &ra);
   // Raise signal
   raise(sig);
   // Restore program signal action (if signal handler returns)
-  sigaction(sig, &ract, NULL);
+  sigaction(sig, &ra, NULL);
 }
 
 void process_trap(int signum, siginfo_t *info, ucontext_t *ctx) {
   debug("Trap");
-  debug_ctx(ctx);
+  debug_ctx(ctx, info);
 
   uint8_t *rip = (uint8_t *) ctx->uc_mcontext.gregs[REG_RIP];
   int trapno = ctx->uc_mcontext.gregs[REG_TRAPNO];
 
-  //if (trapno != 1) process_breakpoint(rip); else
+  if (trapno != 1 && process_breakpoint(rip, ctx) >= 0) return;
   if (trapno == 1 && step(rip, ctx) >= 0) return;
 
   process_raise(SIGSEGV);
 }
 void process_segv(int signum, siginfo_t *info, ucontext_t *ctx) {
   debug("Segv");
-  debug_ctx(ctx);
+  debug_ctx(ctx, info);
   
   void *dest = info->si_addr;
   void *rip = (void *) ctx->uc_mcontext.gregs[REG_RIP];
@@ -466,14 +533,94 @@ void process_segv(int signum, siginfo_t *info, ucontext_t *ctx) {
   process_raise(SIGSEGV);
 }
 
+int process_relocate(ptrdiff_t displacement) {
+  char *page;
+
+  // Move the data segment
+  page = &edata-(size_t) &edata%process.pagesize;
+  if (mprotect(page, process.pagesize, PROT_READ|PROT_WRITE) < 0) return -1;
+  while (mprotect(page-process.pagesize, process.pagesize, PROT_READ|PROT_WRITE) >= 0) page -= process.pagesize;
+  if (mmap(page+displacement, &edata-page, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) return -1;
+  memcpy(page+displacement, page, &edata-page);
+
+  // Move the BSS segment
+  page = &end-(size_t) &end%process.pagesize;
+  if (mprotect(page, process.pagesize, PROT_READ|PROT_WRITE) < 0) return -1;
+  while (mprotect(page-process.pagesize, process.pagesize, PROT_READ|PROT_WRITE) >= 0) page -= process.pagesize;
+  if (mmap(page+displacement, &end-page, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) return -1;
+  memcpy(page+displacement, page, &end-page);
+
+  // Move text segment
+  page = &etext-(size_t) &etext%process.pagesize;
+  if (mprotect(page, process.pagesize, PROT_READ|PROT_EXEC) < 0) return -1;
+  while (mprotect(page-process.pagesize, process.pagesize, PROT_READ|PROT_EXEC) >= 0) page -= process.pagesize;
+  if (mmap(page+displacement, &etext-page, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) return -1;
+  memcpy(page+displacement, page, &etext-page);
+  mprotect(page+displacement, &etext-page, PROT_READ|PROT_EXEC);
+
+  asm volatile ("lea process_relocated(%0), %%rax; push %%rax; ret; process_relocated:": : "r" (displacement) : "rax");
+
+  munmap(page, &etext-page);
+
+  asm volatile ("leave; pop %%rbx; add %0, %%rbx; push %%rbx; ret": : "r" (displacement) : "rax", "rbx");
+  return 0;
+
+  /* Newer kernel:
+  while (mremap(page, process.pagesize, process.pagesize, MREMAP_FIXED, page+displacement) != MAP_FAILED) page -= process.pagesize;
+  mprotect(page, &etext-page, PROT_READ|PROT_EXEC);
+
+  // Move the BSS segment
+  page = (void *) &end-(size_t) &end%process.pagesize;
+  while (mremap(page, process.pagesize, process.pagesize, MREMAP_FIXED, page+displacement) != MAP_FAILED) page -= process.pagesize;
+
+  // Move the data segment
+  page = (void *) &edata-(size_t) &edata%process.pagesize;
+  while (mremap(page, process.pagesize, process.pagesize, MREMAP_FIXED, page+displacement) != MAP_FAILED) page -= process.pagesize;
+
+  // Displace RIP
+  asm volatile ("lea process_relocated(%0), %%rax; push %%rax; ret; process_relocated:": : "r" (displacement) : "rax");
+  */
+}
+
+int process_clean() {
+  struct link_map *lm, vdso;
+  void *addr, *left, *right, *high;
+  register void *sp asm("rsp");
+
+  // Unmap any pages before the beginning of the text segment
+  if (munmap(NULL, process.text) < 0) return NULL;
+
+  // Prepend VDSO base address
+  vdso.l_addr = (void *) getauxval(AT_SYSINFO_EHDR);
+  vdso.l_next = dlopen(NULL, RTLD_NOW);
+  // Iterate open DL base addresses
+  for (left = NULL, right = NULL, high = NULL, lm = &vdso; lm; lm = lm->l_next) if (lm->l_addr) {
+    addr = lm->l_addr;
+    // Find least address below the stack
+    if (addr < sp) left = addr <= left-1 ? addr : left;
+    // Find least address in the AMD64 47-bit address space, above the stack
+    else right = addr <= right-1 ? addr : right;
+    // Find least address in the full 64-bit space, above the satck 
+    if (addr >= PROCESS_LIMIT || high) high = right <= high-1 ? right : high;
+  }
+  // Clear address range between leasr address and stack pointer
+  if (left) if (munmap(left, sp-left-process.pagesize+1) < 0) return -1;
+  // Clear range from the stack's end to the end of the address space
+  if (right && right < PROCESS_LIMIT-process.pagesize) if (munmap(right, (void *) PROCESS_LIMIT-right-process.pagesize) < 0) return -1;
+  // Attempt to clear remaining high addresses
+  if (high) if (munmap(high, (void *) -1UL-PROCESS_LIMIT-high-process.pagesize)) return -1;
+
+  // TODO: verify /proc/self/maps to contain no x rights here
+  return 0;
+}
+
 extern void *process_create() {
   if (process.base) return (void *) process.base;
   // TODO: test signal handlers
 
   register size_t rsp asm("rsp");
-  int r;
+  int r, i;
   size_t stack, text, data, heap;
-  struct sigaction tact, sact;
   struct process p;
   size_t length;
 
@@ -484,8 +631,11 @@ extern void *process_create() {
   if (p.pagesize <= 0) return NULL;
 
   // Get the minimum base address for any text reflection
-  for (p.base = 1; p.base < rsp; p.base <<= 1);
+  for (p.base = 1, i = -1; p.base <= rsp; p.base <<= 1, i++);
   p.base >>= 2*(PROCESS_SCALE+PROCESS_SPACE); // Minimum address whose scaled spring or pages won't intersect with data segments with address space
+
+  dict.mask.displacement = i/8; // Set the jump address byte to be masked
+  dict.mask.mask = ~(1<<i%8); // Set the jump address bit to be masked
 
   // End of the data segment is provided by POSIX
   p.heap = (size_t) &end;
@@ -506,21 +656,8 @@ extern void *process_create() {
   // Find beginning of the text segment and protect text
   while (p.text-p.pagesize >= 0 && mprotect((void *) p.text-p.pagesize, p.pagesize, PROT_READ|PROT_EXEC) >= 0) p.text -= p.pagesize;
 
-  // Unmap any pages before the beginning of the text segment
-  if (munmap(NULL, p.text) < 0) return NULL;
-
-  // Register trap
-  memset(&tact, 0, sizeof(struct sigaction));
-  tact.sa_sigaction = (void (*)(int, siginfo_t *, void *)) process_trap;
-  sigaction(SIGTRAP, &tact, NULL);
-
-  // Register sigsegv handler
-  memset(&sact, 0, sizeof(struct sigaction));
-  sact.sa_sigaction = (void (*)(int, siginfo_t *, void *)) process_segv;
-  sact.sa_flags = SA_SIGINFO;
-  sigaction(SIGSEGV, &sact, NULL);
-
-  //set_trap();
+  // Clean the address space from VDSO and DLs possibly loaded
+  //if (process_clean() < 0) return NULL;
 
   process = p; // Publish process
   return (void *) process.base;
@@ -537,7 +674,7 @@ extern void *process_malloc(size_t size) {
   addr = malloc(size);
   if (!addr) return NULL;
 
-  // Address too low
+  // Address too left
   if ((size_t) addr+size > (size_t) addr<<PROCESS_SCALE) {
     // Reallocate memory if the end of the section might overlap the beginning
     // of the scaled section, second allocation never overlaps due to arithmetics
@@ -547,7 +684,7 @@ extern void *process_malloc(size_t size) {
     if (!addr) return NULL;
   }
 
-  // Address too high
+  // Address too right
   if ((size_t) (addr+size)<<PROCESS_SCALE >= rsp-process.pagesize) {
     // If scaled pages do not fit in before the stack, memory is exhausted
     free(addr);
@@ -560,6 +697,26 @@ extern void *process_malloc(size_t size) {
     return NULL;
   }
   return addr;
+}
+
+void process_exe(void *target) {
+  struct sigaction ta, sa;
+  void (*spring)() = getspring(target);
+
+  if (!process.pagesize) process_create();
+
+  // Register trap
+  memset(&ta, 0, sizeof(struct sigaction));
+  ta.sa_sigaction = (void (*)(int, siginfo_t *, void *)) process_trap;
+  sigaction(SIGTRAP, &ta, &process.sigtrap);
+
+  // Register sigsegv handler
+  memset(&sa, 0, sizeof(struct sigaction));
+  sa.sa_sigaction = (void (*)(int, siginfo_t *, void *)) process_segv;
+  sa.sa_flags = SA_SIGINFO;
+  sigaction(SIGSEGV, &sa, &process.sigsegv);
+
+  asm ("mov $.process_exit, %%rax; mov %%rax, (%0); call %1; .process_exit:": : "r"(&process.exit), "r"(spring): "rax");
 }
 
 #endif
